@@ -282,6 +282,9 @@ def train(args):
             loss.backward()
             optimizer.step()
 
+            # Free MPS memory
+            torch.mps.empty_cache()
+
             # Check for NaN
             has_nan = any(torch.isnan(p).any() for p in model.parameters())
             if has_nan:
