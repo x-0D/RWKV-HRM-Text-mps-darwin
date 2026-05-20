@@ -29,6 +29,17 @@ from utils.functions import load_model_class, get_model_source_path
 from dataset_new import V1Dataset, V1DatasetConfig, V1DatasetMeta
 
 
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE = get_device()
+
+
 class ArchConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
 
@@ -71,6 +82,7 @@ class PretrainConfig(pydantic.BaseModel):
     seed: int = 0
     checkpoint_interval: int = 1
     log_interval: int = 5
+    pretrained_path: Optional[str] = None
 
 
 @dataclass
@@ -85,6 +97,7 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, local_batch_size: int, drop_last_batch: bool, rank: int, world_size: int):
+    pin = DEVICE == "cuda"  # Only pin memory for CUDA
     dataset = V1Dataset(V1DatasetConfig(
         seed=config.seed,
 
@@ -104,7 +117,7 @@ def create_dataloader(config: PretrainConfig, local_batch_size: int, drop_last_b
         num_workers=1,
         prefetch_factor=8,
 
-        pin_memory=True,
+        pin_memory=pin,
         persistent_workers=True  # NOTE: Required for correct epoch handling
     )
     return dataloader, dataset.metadata
@@ -130,23 +143,52 @@ def create_model_and_carry(config: PretrainConfig, train_metadata: V1DatasetMeta
     model_cls = load_model_class(config.arch.name)
     head_cls = load_model_class(config.arch.head)
 
-    with torch.device("cuda"):
-        model: nn.Module = model_cls(model_cfg)
-        carry = model.initial_carry(local_batch_size, dtype=fwd_bwd_dtype)  # pyright: ignore[reportCallIssue]
-        # Attach loss head
-        model = head_cls(model, model_cfg)
+    # On MPS: create model on CPU first, convert to bf16, then move to MPS
+    use_mps_bf16 = (DEVICE == "mps" and config.fwd_bwd_dtype == "bfloat16")
 
-    # ----FSDP----
-    # Broadcast buffers
-    for buffer in model.buffers():
-        dist.broadcast(buffer, src=0)
+    if use_mps_bf16:
+        # Create on CPU in fp32 (MPS doesn't support bf16 for linalg ops during init)
+        with torch.device("cpu"):
+            model: nn.Module = model_cls(model_cfg)
+            model = head_cls(model, model_cfg)
+        # Convert to bf16 and move to MPS
+        model = model.to(device=DEVICE, dtype=fwd_bwd_dtype)
+        carry = model.model.initial_carry(1, dtype=fwd_bwd_dtype)
+    else:
+        with torch.device(DEVICE):
+            model: nn.Module = model_cls(model_cfg)
+            carry = model.initial_carry(1, dtype=fwd_bwd_dtype)
+            # Attach loss head
+            model = head_cls(model, model_cfg)
 
-    # Detect TransformerBlock recursively and apply FSDP
-    for module in model.modules():
-        if isinstance(module, TransformerBlock):
-            apply_fsdp(module, fwd_bwd_dtype)
+    # Load pretrained checkpoint (RADLADS surgery)
+    if config.pretrained_path is not None:
+        sd = torch.load(config.pretrained_path, map_location='cpu', weights_only=True)
+        base_sd = {k: v.to(dtype=fwd_bwd_dtype) if use_mps_bf16 else v
+                   for k, v in sd.items() if k.startswith(('H_level.', 'L_level.', 'zL_init'))}
+        head_sd = {k: v.to(dtype=fwd_bwd_dtype) if use_mps_bf16 else v
+                   for k, v in sd.items() if k.startswith(('embed_tokens.', 'lm_head.'))}
+        msg_base = model.model.load_state_dict(base_sd, strict=False)
+        msg_head = model.load_state_dict(head_sd, strict=False)
+        missing_b, unexpected_b = msg_base
+        missing_h, unexpected_h = msg_head
+        if unexpected_b or unexpected_h:
+            print(f"  [WARN] Unexpected keys: {unexpected_b} {unexpected_h}")
+        if missing_b or missing_h:
+            print(f"  [WARN] Missing keys: {missing_b} {missing_h}")
+        print(f"  Loaded {len(sd)} tensors from {config.pretrained_path}")
 
-    apply_fsdp(model, fwd_bwd_dtype)
+    # FSDP only on CUDA with distributed
+    if DEVICE == "cuda" and dist.is_initialized():
+        for buffer in model.buffers():
+            dist.broadcast(buffer, src=0)
+
+        # Detect TransformerBlock recursively and apply FSDP
+        for module in model.modules():
+            if isinstance(module, TransformerBlock):
+                apply_fsdp(module, fwd_bwd_dtype)
+
+        apply_fsdp(model, fwd_bwd_dtype)
 
     # ----Create optimizer----
     optim = AdamATan2(model.parameters(),
@@ -197,7 +239,6 @@ def update_lr(config: PretrainConfig, train_state: TrainState) -> float:
     return lr
 
 
-@torch.compile(dynamic=False)
 def train_batch(train_state: TrainState, batch: dict[str, Tensor], **kwargs):
     train_state.carry, loss, metrics = train_state.model(batch=batch, carry=train_state.carry, **kwargs)
     loss.backward()
@@ -211,7 +252,9 @@ def reduce_metrics(local_metrics: dict[str, Tensor], prefix: str):
     metric_keys = list(sorted(local_metrics.keys()))  # Sort keys to guarantee all processes use the same order.
     # Reduce and reconstruct
     metric_values = torch.stack([local_metrics[k][0] for k in metric_keys] + [local_metrics[k][1] for k in metric_keys])
-    dist.reduce(metric_values, dst=0)
+
+    if dist.is_initialized():
+        dist.reduce(metric_values, dst=0)
     # Split and normalize
     metrics, metrics_div = metric_values.chunk(2, dim=-1)
     metrics = (metrics / metrics_div).cpu().numpy().tolist()
@@ -247,7 +290,7 @@ def save_code_and_config(config: PretrainConfig, train_metadata: V1DatasetMeta):
 def load_synced_config(hydra_config: DictConfig, rank: int) -> PretrainConfig:
     objects = [None]
     if rank == 0:
-        config = PretrainConfig(**OmegaConf.to_container(hydra_config, resolve=True))  # type: ignore
+        config = PretrainConfig(**OmegaConf.to_container(hydra_config, resolve=True))
 
         # Naming
         if config.project_name is None:
@@ -259,7 +302,8 @@ def load_synced_config(hydra_config: DictConfig, rank: int) -> PretrainConfig:
 
         objects = [config]
 
-    dist.broadcast_object_list(objects, src=0)
+    if dist.is_initialized():
+        dist.broadcast_object_list(objects, src=0)
     return objects[0]  # type: ignore
 
 
@@ -310,8 +354,10 @@ def launch(hydra_config: DictConfig):
             lr = update_lr(config, train_state)
             # Extra train arguments (such as BP warmup etc.)
             train_extra_args = train_state.model.compute_train_extra_args(train_state)  # pyright: ignore[reportCallIssue]
-            
-            metrics = train_batch(train_state, batch | {k: wrap_tensor(torch.tensor(v, device="cpu")) for k, v in batch_info.items()}, **train_extra_args)
+
+            batch_data = {k: v.to(device=DEVICE) for k, v in batch.items()}
+            batch_info_data = {k: wrap_tensor(torch.tensor(v, device="cpu")) for k, v in batch_info.items()}
+            metrics = train_batch(train_state, batch_data | batch_info_data, **train_extra_args)
 
             if train_state.step % config.log_interval == 0:
                 metrics = reduce_metrics(metrics, prefix="train/")
@@ -326,10 +372,14 @@ def launch(hydra_config: DictConfig):
         ############ Checkpointing
         if (epoch % config.checkpoint_interval == 0) or (epoch == config.epochs):
             if config.checkpoint_path is not None:
-                # Save checkpoint
-                dcp.save({"model": train_state.model.state_dict(), "optim": get_optimizer_state_dict(train_state.model, train_state.optim)},  # pyright: ignore[reportPrivateImportUsage]
-                         checkpoint_id=os.path.join(config.checkpoint_path, f"fsdp2_epoch_{epoch}"))
-                # Save carry on all ranks
+                if dist.is_initialized():
+                    # Save checkpoint
+                    dcp.save({"model": train_state.model.state_dict(), "optim": get_optimizer_state_dict(train_state.model, train_state.optim)},
+                             checkpoint_id=os.path.join(config.checkpoint_path, f"fsdp2_epoch_{epoch}"))
+                else:
+                    # Save carry on all ranks
+                    torch.save(train_state.model.state_dict(),
+                               os.path.join(config.checkpoint_path, f"model_epoch_{epoch}.pt"))
                 torch.save(train_state.carry, os.path.join(config.checkpoint_path, f"carry_epoch_{epoch}.{RANK}.pt"))
 
     # finalize

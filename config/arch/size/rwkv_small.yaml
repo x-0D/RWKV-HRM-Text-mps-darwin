@@ -1,0 +1,13 @@
+# Small RWKV for 6GB GPU
+n_layers: 16
+
+hidden_size: 1024
+num_heads: 16
+expansion: 4
+
+norm_type: pre
+norm_eps: 1e-6
+
+init_type: lecun_normal
+
+head_size: 64

@@ -1,0 +1,13 @@
+# Base RWKV (matches HRM-Text L in hidden size, but with WKV)
+n_layers: 24
+
+hidden_size: 1280
+num_heads: 20
+expansion: 4
+
+norm_type: pre
+norm_eps: 1e-6
+
+init_type: lecun_normal
+
+head_size: 64

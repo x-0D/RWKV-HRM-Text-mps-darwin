@@ -1,6 +1,6 @@
 ![](./assets/banner.png)
 
-# HRM-Text: Efficient Pretraining Beyond Scaling
+# HRM-Text: Efficient Pretraining Beyond Scaling (with RWKV Vibecoded from BlinkDL RWKV-7 sources)
 
 <p align="center">
   <a href="https://sapientinc.github.io/HRM-Text/assets/HRM_Text.pdf"><img src="https://img.shields.io/badge/Paper-PDF-red" alt="Paper"></a>
@@ -247,6 +247,105 @@ For changes that alter pretraining behavior, we strongly recommend running pretr
 For infrastructure changes intended to be behavior-preserving, include before/after speed, memory, or stability measurements and show that benchmark quality does not regress.
 
 For model-quality changes, we evaluate whether the change improves the Pareto frontier of training compute versus performance. Strict improvements and high-ROI changes are good candidates for defaults; valuable tradeoffs with higher cost or lower performance may belong in separate configs.
+
+## HRM-Text (RWKV Hybrid Variant)
+
+This variant replaces standard QKV self-attention with the RWKV-7 "Goose" TimeMix (WKV linear attention), keeping the hierarchical H/L-cycle structure and SwiGLU MLPs intact. The WKV operator provides linear-complexity sequence processing with a learnable recurrence, making it suitable for low-resource hardware.
+
+### Architecture
+
+- **Attention:** RWKV-7 TimeMix (WKV linear attention) replaces standard multi-head attention
+- **MLP:** SwiGLU (unchanged from original HRM-Text)
+- **Hierarchy:** H-level (slow) / L-level (fast) recurrent cycles (unchanged)
+- **Position:** Time-shift mixing (learnable per-channel gates) replaces RoPE
+- **Recurrence:** State-free training (full-sequence WKV) with BP-warmup gradient routing
+
+### Key Benefits
+
+| Feature | Benefit |
+|---|---|
+| Linear attention (WKV) | O(T) memory instead of O(T²) for FlashAttention |
+| No FlashAttention dependency | Runs on CUDA, MPS, and CPU |
+| RWKV-7 init scheme | Stable training without loss spikes |
+| LoRA parameterization | Fewer attention params than QKV |
+
+### Launch Pretraining (RWKV Variant)
+
+Here's how i run this thing:
+```
+PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 uv run python train_mps.py \
+    --data-path data/hrm_text_small \
+    --lr 1e-4 \
+    --epochs 1 \
+    --batch-max-length 256 \
+    --save-dir checkpoints/hrm_rwkv_768m_train \
+    --save-every 10 \
+    --log-every 1 \
+    --resume checkpoints/hrm_rwkv_768m_train/ckpt_latest.pth
+```
+
+#### 6 GB NVIDIA GPU (e.g. RTX 3060/4060, RTX 2070/2080)
+
+The RWKV hybrid uses linear-complexity WKV attention, so you can train on consumer GPUs with limited VRAM:
+
+```bash
+# Tiny model (12 layers, 768 hidden) — fits in ~5 GB with batch size 2
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+torchrun --nproc_per_node=1 pretrain.py \
+  arch/net@arch=hrm_rwkv \
+  arch/size@arch=rwkv_tiny \
+  lr=3e-4 \
+  global_batch_size=8192 \
+  fwd_bwd_dtype=bfloat16
+```
+
+```bash
+# Small model (16 layers, 1024 hidden) — fits in ~5.5 GB with batch size 1
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+torchrun --nproc_per_node=1 pretrain.py \
+  arch/net@arch=hrm_rwkv \
+  arch/size@arch=rwkv_small \
+  lr=2.5e-4 \
+  global_batch_size=4096 \
+  fwd_bwd_dtype=bfloat16
+```
+
+**Memory tips for 6 GB cards:**
+- Use `fwd_bwd_dtype=bfloat16` (or `float16` if BF16 not supported)
+- Use `global_batch_size=2048` with gradient accumulation (set `micro_batch_size` in dataset config)
+- Reduce `max_seq_len` to 1024 if needed
+- The WKV sequential loop is O(T × H × N²); shorter sequences reduce compute quadratically
+
+#### M2 MacBook (MPS Backend)
+
+The pure-PyTorch WKV implementation runs on Apple Silicon via the MPS backend:
+
+```bash
+# Single-process training (no torchrun needed on Mac)
+python pretrain.py \
+  arch/net@arch=hrm_rwkv \
+  arch/size@arch=rwkv_tiny \
+  lr=3e-4 \
+  global_batch_size=2048 \
+  fwd_bwd_dtype=bfloat16
+```
+
+**MPS notes:**
+- Install PyTorch with MPS support: `pip3 install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly`
+- The WKV pure-PyTorch kernel runs on MPS but is slower than CUDA; expect 3-5× longer training
+- Use `global_batch_size=1024` and max_seq_len=512 for reasonable memory on 16 GB unified memory
+- `torch.compile` is supported on macOS 14+ (Sonoma) for modest speedups
+
+### Available Configs
+
+| Config | Layers | Hidden | Heads | Head Size | Params (approx) |
+|---|---|---|---|---|---|
+| `arch/size@arch=rwkv_tiny` | 12 | 768 | 12 | 64 | ~500M |
+| `arch/size@arch=rwkv_small` | 16 | 1024 | 16 | 64 | ~900M |
+| `arch/size@arch=rwkv_base` | 24 | 1280 | 20 | 64 | ~1.4B |
+| `arch/size@arch=rwkv_xl` | 32 | 1536 | 24 | 64 | ~2.0B |
+
+Half-layers is enabled by default, splitting layers evenly between H and L stacks.
 
 ## Paper
 

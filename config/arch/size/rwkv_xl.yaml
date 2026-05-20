@@ -1,0 +1,13 @@
+# XL RWKV (matches HRM-Text XL in hidden size)
+n_layers: 32
+
+hidden_size: 1536
+num_heads: 24
+expansion: 4
+
+norm_type: pre
+norm_eps: 1e-6
+
+init_type: lecun_normal
+
+head_size: 64

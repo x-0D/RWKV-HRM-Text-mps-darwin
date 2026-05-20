@@ -48,10 +48,10 @@ class AdamATan2(Optimizer):
                 # Step counter
                 state["step"] = torch.tensor(0.0, dtype=torch.get_default_dtype())
 
-                # Momentum
+                # Momentum — always use fp32 for numerical stability
                 if group["betas"][0] > 0:
-                    state["exp_avg"] = torch.zeros_like(p)
-                state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["exp_avg"] = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
+                state["exp_avg_sq"] = torch.zeros(p.shape, dtype=torch.float32, device=p.device)
 
                 # Extra features
                 if group["ema"] is not None:
@@ -68,7 +68,16 @@ class AdamATan2(Optimizer):
                     continue
                 
                 state = self.state[param]
-                grad = param.grad
+                # Convert gradient to fp32 for numerical stability
+                grad = param.grad.float()
+
+                # Ensure optimizer states are fp32 (handles checkpoint resume from bf16)
+                if "exp_avg" in state and state["exp_avg"].dtype != torch.float32:
+                    state["exp_avg"] = state["exp_avg"].float()
+                if state["exp_avg_sq"].dtype != torch.float32:
+                    state["exp_avg_sq"] = state["exp_avg_sq"].float()
+                if "param_ema" in state and state["param_ema"].dtype != torch.float32:
+                    state["param_ema"] = state["param_ema"].float()
 
                 # Weight decay update
                 if group["weight_decay"] != 0:

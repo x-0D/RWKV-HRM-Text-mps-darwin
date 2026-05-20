@@ -8,7 +8,10 @@ from einops import rearrange
 
 from models.common import trunc_normal_init_, unwrap_tensor
 from models.flash_attention_prefixlm_v2 import flash_attn_varlen_prefixlm
-from flash_attn_interface import flash_attn_with_kvcache
+try:
+    from flash_attn_interface import flash_attn_with_kvcache
+except ImportError:
+    flash_attn_with_kvcache = None
 
 
 Carry = dict[str, Any]

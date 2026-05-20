@@ -1,0 +1,14 @@
+# @package __global__
+# Matches sapientinc/HRM-Text-1B architecture for model surgery
+n_layers: 32
+hidden_size: 1536
+num_heads: 24        # 1536 / HEAD_SIZE(64) = 24
+expansion: 4
+head_size: 64
+norm_eps: 1e-6
+half_layers: True    # → 16 layers per stack (matches HF num_hidden_layers=16)
+H_cycles: 2
+L_cycles: 3
+bp_warmup_ratio: 0.2
+bp_min_steps: 2
+bp_max_steps: 5

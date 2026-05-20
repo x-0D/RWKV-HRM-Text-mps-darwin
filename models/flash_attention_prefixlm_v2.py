@@ -4,7 +4,11 @@ import torch
 from torch import Tensor
 import numpy as np
 
-from flash_attn_interface import _flash_attn_backward, maybe_contiguous
+try:
+    from flash_attn_interface import _flash_attn_backward, maybe_contiguous
+except ImportError:
+    _flash_attn_backward = None
+    maybe_contiguous = None
 
 
 def compute_aux_seq_tensors_scalars(prefix_lens: np.ndarray, causal_lens: np.ndarray, batch_max_tokens: int):
